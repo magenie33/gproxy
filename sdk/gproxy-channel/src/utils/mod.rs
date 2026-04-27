@@ -6,6 +6,8 @@ pub mod claude_cache_control;
 pub mod claude_sampling;
 #[cfg(feature = "claudecode")]
 pub mod claudecode_cookie;
+#[cfg(feature = "claudecode")]
+pub mod claudecode_local_keychain;
 #[cfg(any(feature = "antigravity", feature = "geminicli"))]
 pub mod code_assist_envelope;
 #[cfg(any(feature = "antigravity", feature = "geminicli"))]

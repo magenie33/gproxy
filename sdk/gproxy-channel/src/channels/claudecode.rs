@@ -1344,6 +1344,55 @@ impl Channel for ClaudeCodeChannel {
         let client = client.clone();
         let span = tracing::info_span!("refresh_credential", channel = "claudecode");
         async move {
+            // Path 0: Adopt Claude Code CLI's own credential state when it
+            // lives on the same machine.
+            //
+            // Anthropic rotates `refresh_token` on every successful refresh.
+            // If the user runs Claude Code locally, both gproxy and the CLI
+            // target the same OAuth session; whichever side calls the
+            // `refresh_token` grant second invalidates the other. Reading
+            // Claude Code's keychain (read-only) lets us *adopt* the token
+            // the CLI just refreshed for its own use, instead of racing
+            // against it.
+            //
+            // We only adopt tokens that are still comfortably non-expired
+            // (>60s of life). If Claude Code's own token has expired too,
+            // we fall through to Path 1 below — refreshing once on Claude
+            // Code's behalf is acceptable because the CLI would have
+            // refreshed shortly anyway.
+            if let Some(snapshot) =
+                crate::utils::claudecode_local_keychain::read_claudecode_local_credentials()
+            {
+                let now_ms = crate::utils::oauth::current_unix_ms();
+                // Adopt when the keychain looks at least as live as our
+                // credential AND has comfortable runway. Two cases:
+                //   (a) keychain has a different access_token (Claude Code
+                //       refreshed) — copy everything.
+                //   (b) keychain has the same access_token but a later
+                //       expiry — our metadata is stale; sync and skip the
+                //       refresh_token grant entirely.
+                let snapshot_is_fresh = snapshot.expires_at_ms > now_ms.saturating_add(60_000);
+                let token_changed = snapshot.access_token != credential.access_token;
+                let metadata_advanced = snapshot.expires_at_ms > credential.expires_at_ms;
+                if snapshot_is_fresh && (token_changed || metadata_advanced) {
+                    credential.access_token = snapshot.access_token;
+                    credential.refresh_token = snapshot.refresh_token;
+                    credential.expires_at_ms = snapshot.expires_at_ms;
+                    tracing::info!(
+                        token_changed,
+                        metadata_advanced,
+                        "credential refreshed by adopting local Claude Code keychain state"
+                    );
+                    return Ok(true);
+                }
+                tracing::debug!(
+                    snapshot_is_fresh,
+                    token_changed,
+                    metadata_advanced,
+                    "claudecode keychain present but not adopted"
+                );
+            }
+
             // Path 1: Anthropic OAuth `refresh_token` grant.
             //
             // We do NOT use the generic `oauth2_refresh::refresh_oauth2_token`
