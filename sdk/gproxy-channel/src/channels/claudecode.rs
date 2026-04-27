@@ -1355,25 +1355,24 @@ impl Channel for ClaudeCodeChannel {
             // the CLI just refreshed for its own use, instead of racing
             // against it.
             //
-            // We only adopt tokens that are still comfortably non-expired
-            // (>60s of life). If Claude Code's own token has expired too,
-            // we fall through to Path 1 below — refreshing once on Claude
-            // Code's behalf is acceptable because the CLI would have
-            // refreshed shortly anyway.
+            // The presence of a Claude Code credential entry on this machine
+            // is itself the signal that gproxy must treat the CLI as the
+            // sole authority over the OAuth lifecycle. When an entry exists:
+            //   - fresh → adopt and continue (no Anthropic refresh call)
+            //   - stale → REFUSE to refresh and surface a clear error,
+            //     because rotating now would invalidate the CLI's session
+            //     and force the user to /login again
+            // Without a local entry (most Linux deployments, headless
+            // servers, etc.) the historical Path 1 / Path 2 logic still
+            // applies as before.
             if let Some(snapshot) =
                 crate::utils::claudecode_local_keychain::read_claudecode_local_credentials()
             {
                 let now_ms = crate::utils::oauth::current_unix_ms();
-                // Adopt when the keychain looks at least as live as our
-                // credential AND has comfortable runway. Two cases:
-                //   (a) keychain has a different access_token (Claude Code
-                //       refreshed) — copy everything.
-                //   (b) keychain has the same access_token but a later
-                //       expiry — our metadata is stale; sync and skip the
-                //       refresh_token grant entirely.
                 let snapshot_is_fresh = snapshot.expires_at_ms > now_ms.saturating_add(60_000);
                 let token_changed = snapshot.access_token != credential.access_token;
                 let metadata_advanced = snapshot.expires_at_ms > credential.expires_at_ms;
+
                 if snapshot_is_fresh && (token_changed || metadata_advanced) {
                     credential.access_token = snapshot.access_token;
                     credential.refresh_token = snapshot.refresh_token;
@@ -1385,12 +1384,34 @@ impl Channel for ClaudeCodeChannel {
                     );
                     return Ok(true);
                 }
-                tracing::debug!(
-                    snapshot_is_fresh,
-                    token_changed,
-                    metadata_advanced,
-                    "claudecode keychain present but not adopted"
+
+                if snapshot_is_fresh {
+                    // Snapshot is fresh but matches what we already have —
+                    // nothing to refresh, but the channel was still asked
+                    // for one. Treat as no-op success.
+                    tracing::debug!(
+                        "claudecode keychain matches current credential, no refresh needed"
+                    );
+                    return Ok(false);
+                }
+
+                // Snapshot exists but expired. Refusing to call the
+                // refresh_token grant is the whole point of this code path:
+                // calling it would rotate the OAuth session and log Claude
+                // Code out. Surface a clear, actionable error instead.
+                tracing::warn!(
+                    snapshot_expires_at_ms = snapshot.expires_at_ms,
+                    now_ms,
+                    "claudecode keychain entry is stale; refusing to rotate the shared OAuth session"
                 );
+                return Err(UpstreamError::Channel(format!(
+                    "Claude Code keychain entry is stale (expired {}ms ago). \
+                     Refusing to call refresh_token grant because that would \
+                     invalidate the local Claude Code session. Run `claude` \
+                     once interactively (or any command that triggers a \
+                     refresh) and retry.",
+                    now_ms.saturating_sub(snapshot.expires_at_ms),
+                )));
             }
 
             // Path 1: Anthropic OAuth `refresh_token` grant.
