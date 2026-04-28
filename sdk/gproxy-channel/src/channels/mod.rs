@@ -8,6 +8,8 @@ pub mod antigravity;
 pub mod chatgpt;
 #[cfg(feature = "claudecode")]
 pub mod claudecode;
+#[cfg(feature = "claudecode")]
+pub mod claudecode_health;
 #[cfg(feature = "codex")]
 pub mod codex;
 #[cfg(feature = "custom")]

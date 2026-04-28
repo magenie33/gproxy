@@ -12,7 +12,6 @@ use crate::channel::{
     OAuthFlow,
 };
 use crate::count_tokens::CountStrategy;
-use crate::health::ModelCooldownHealth;
 use crate::registry::ChannelRegistration;
 use crate::request::PreparedRequest;
 use crate::response::{ResponseClassification, UpstreamError};
@@ -870,7 +869,10 @@ impl Channel for ClaudeCodeChannel {
     const ID: &'static str = "claudecode";
     type Settings = ClaudeCodeSettings;
     type Credential = ClaudeCodeCredential;
-    type Health = ModelCooldownHealth;
+    // Keychain-aware health: dead credentials regain eligibility automatically
+    // once the local Claude Code keychain is refreshed by the CLI. See
+    // `claudecode_health.rs` for the rationale.
+    type Health = super::claudecode_health::ClaudeCodeKeychainAwareHealth;
 
     fn routing_table(&self) -> RoutingTable {
         let mut t = RoutingTable::new();
@@ -1323,17 +1325,38 @@ impl Channel for ClaudeCodeChannel {
         if credential.access_token.trim().is_empty() {
             return true;
         }
-        // Refresh when within a 60s skew window of `expires_at_ms`.
-        // `expires_at_ms == 0` means "unknown" and is treated as valid
-        // (the normal 401 → refresh path still covers stale tokens).
-        if credential.expires_at_ms == 0 {
-            return false;
-        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        credential.expires_at_ms <= now_ms.saturating_add(60_000)
+
+        // Refresh when within a 60s skew window of `expires_at_ms`.
+        // `expires_at_ms == 0` means "unknown" and is treated as valid
+        // (the normal 401 → refresh path still covers stale tokens).
+        if credential.expires_at_ms != 0
+            && credential.expires_at_ms <= now_ms.saturating_add(60_000)
+        {
+            return true;
+        }
+
+        // Even when our own metadata says "still valid", check whether the
+        // local Claude Code keychain has a newer token. This covers the
+        // case where a credential was marked dead after a 401, the
+        // keychain-aware health later granted it a resurrection chance,
+        // and we now need to actually adopt the fresh keychain state
+        // before sending another request — otherwise we'd just send the
+        // same already-rejected access_token again and re-trigger 401.
+        if let Some(snapshot) =
+            crate::utils::claudecode_local_keychain::read_claudecode_local_credentials()
+        {
+            let snapshot_is_fresh = snapshot.expires_at_ms > now_ms.saturating_add(60_000);
+            let token_changed = snapshot.access_token != credential.access_token;
+            if snapshot_is_fresh && token_changed {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn refresh_credential<'a>(

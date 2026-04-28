@@ -155,9 +155,12 @@ impl ProviderStore {
                 let creds: Vec<_> = credentials
                     .into_iter()
                     .filter_map(|c| {
+                        // Health type is inferred from add_provider_with_routing's
+                        // generic bound — channels that override C::Health (e.g.
+                        // claudecode's keychain-aware variant) get it for free.
                         serde_json::from_value(c)
                             .ok()
-                            .map(|c| (c, gproxy_channel::health::ModelCooldownHealth::default()))
+                            .map(|c| (c, Default::default()))
                     })
                     .collect();
                 $self.add_provider_with_routing(&name, $ch, settings, creds, routing);

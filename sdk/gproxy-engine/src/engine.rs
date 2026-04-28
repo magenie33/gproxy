@@ -13,7 +13,6 @@ use tracing::Instrument;
 
 use crate::store::{CredentialUpdate, ProviderStore, ProviderStoreBuilder};
 use gproxy_channel::Channel;
-use gproxy_channel::health::ModelCooldownHealth;
 use gproxy_channel::request::PreparedRequest;
 use gproxy_channel::response::UpstreamError;
 use gproxy_channel::routing::RouteKey;
@@ -578,9 +577,16 @@ impl GproxyEngineBuilder {
                 let creds: Vec<_> = credentials
                     .into_iter()
                     .filter_map(|c| {
+                        // Type inference flows from `add_provider_with_routing`'s
+                        // `Vec<(C::Credential, C::Health)>` parameter back to
+                        // here, picking the right `Default` impl for the
+                        // channel's chosen health type. Channels that opt into
+                        // a non-default health (e.g. claudecode's
+                        // keychain-aware variant) get it transparently without
+                        // having to plumb the type through this macro.
                         serde_json::from_value(c)
                             .ok()
-                            .map(|c| (c, ModelCooldownHealth::default()))
+                            .map(|c| (c, Default::default()))
                     })
                     .collect();
                 Ok($self.add_provider_with_routing(&name, $ch, settings, creds, routing))
