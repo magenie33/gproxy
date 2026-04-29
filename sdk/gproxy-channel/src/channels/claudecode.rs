@@ -1418,23 +1418,27 @@ impl Channel for ClaudeCodeChannel {
                     return Ok(false);
                 }
 
-                // Snapshot exists but expired. Refusing to call the
-                // refresh_token grant is the whole point of this code path:
-                // calling it would rotate the OAuth session and log Claude
-                // Code out. Surface a clear, actionable error instead.
-                tracing::warn!(
-                    snapshot_expires_at_ms = snapshot.expires_at_ms,
-                    now_ms,
-                    "claudecode keychain entry is stale; refusing to rotate the shared OAuth session"
+                // Snapshot exists but is stale. Path 0 cannot help. Fall
+                // through to Path 1 (refresh_token grant), but with one
+                // important detail: use the keychain's refresh_token, not
+                // our own. The keychain is the source of truth — Claude
+                // Code's normal usage may have rotated the token several
+                // times since we last seeded our credential, so our copy
+                // is stale even when the keychain's still works. Adopting
+                // the keychain's refresh_token before grant lets us share
+                // the live OAuth thread instead of trying (and failing) to
+                // resurrect our copy.
+                if !snapshot.refresh_token.is_empty()
+                    && snapshot.refresh_token != credential.refresh_token
+                {
+                    tracing::info!(
+                        "adopting keychain refresh_token before grant (gproxy's copy is stale)"
+                    );
+                    credential.refresh_token = snapshot.refresh_token.clone();
+                }
+                tracing::info!(
+                    "claudecode keychain entry is stale, falling through to refresh_token grant + writeback"
                 );
-                return Err(UpstreamError::Channel(format!(
-                    "Claude Code keychain entry is stale (expired {}ms ago). \
-                     Refusing to call refresh_token grant because that would \
-                     invalidate the local Claude Code session. Run `claude` \
-                     once interactively (or any command that triggers a \
-                     refresh) and retry.",
-                    now_ms.saturating_sub(snapshot.expires_at_ms),
-                )));
             }
 
             // Path 1: Anthropic OAuth `refresh_token` grant.
@@ -1459,6 +1463,40 @@ impl Channel for ClaudeCodeChannel {
                     Ok(tokens) => {
                         apply_cookie_exchange_tokens(credential, tokens);
                         tracing::info!("credential refreshed via refresh_token grant");
+
+                        // Write the rotated tokens back to Claude Code's
+                        // local credential store so its next launch reads
+                        // what we just produced rather than the now-
+                        // invalidated old refresh_token. Without this, the
+                        // user has to /login Claude Code every time gproxy
+                        // refreshes during a Claude Code idle window. Best-
+                        // effort: a write failure is logged but doesn't
+                        // fail the request — the credential is still usable
+                        // for this gproxy process.
+                        let snapshot = crate::utils::claudecode_local_keychain::ClaudecodeKeychainSnapshot {
+                            access_token: credential.access_token.clone(),
+                            refresh_token: credential.refresh_token.clone(),
+                            expires_at_ms: credential.expires_at_ms,
+                        };
+                        match crate::utils::claudecode_local_keychain::write_claudecode_local_credentials(&snapshot) {
+                            Ok(true) => {
+                                tracing::info!(
+                                    "rotated tokens written back to local Claude Code keychain"
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    "no local Claude Code keychain to write back to (skipped)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to write rotated tokens back to keychain (Claude Code may need /login on its next use)"
+                                );
+                            }
+                        }
+
                         return Ok(true);
                     }
                     Err(e) if credential.cookie.as_ref().is_some_and(|c| !c.is_empty()) => {
